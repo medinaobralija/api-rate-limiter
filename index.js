@@ -7,27 +7,26 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 3000;
 
-const client = createClient({ url: 'redis://localhost:6379' });
+// Configure Redis client
+const client = createClient({
+	url: process.env.REDIS_URL || 'redis://localhost:6379',
+});
 
-// Redis connection management with retries
 async function connectRedis() {
 	try {
 		await client.connect();
 		console.log('Connected to Redis...');
 	} catch (err) {
 		console.error('Redis connection error:', err);
-		setTimeout(connectRedis, 5000); // Retry after 5 seconds
+		setTimeout(connectRedis, 5000); // Retry connection every 5 seconds
 	}
 }
 
 await connectRedis();
 
+// Redis event handlers
 client.on('error', (err) => {
 	console.error('Redis Client Error', err);
-});
-
-client.on('ready', () => {
-	console.log('Redis client connected and ready!');
 });
 
 client.on('end', () => {
@@ -35,46 +34,45 @@ client.on('end', () => {
 	connectRedis(); // Reconnect on disconnect
 });
 
-// Middleware for rate limiting
-const rateLimiter = async (req, res, next) => {
+// Graceful shutdown
+process.on('SIGINT', async () => {
+	console.log('Shutting down gracefully...');
+	await client.quit();
+	process.exit(0);
+});
+
+// Middleware for customizable rate limits
+const rateLimiter = (timeWindow, maxRequests) => async (req, res, next) => {
 	try {
 		if (!client.isOpen) {
-			console.error('Redis client is not connected');
 			return res.status(500).json({ message: 'Redis connection error' });
 		}
 
+		// Dynamic rate limits per user or route
 		const userIP = req.ip;
-		const timeWindow = process.env.TIME_WINDOW || 60; // time window in seconds
-		const maxRequests = process.env.MAX_REQUESTS || 5;
-
-		// Fetch current request count from Redis
-		const currentRequestCount = await client.get(userIP);
-		const requestCount = currentRequestCount
-			? parseInt(currentRequestCount)
-			: 0;
+		const redisKey = `${userIP}:${req.route.path}`; // Differentiates per route
+		const currentRequests = await client.get(redisKey);
+		const requestCount = currentRequests ? parseInt(currentRequests) : 0;
 
 		if (requestCount >= maxRequests) {
-			const retryAfter = await client.ttl(userIP); // Get time until the key expires
+			const retryAfter = await client.ttl(redisKey);
 
-			// Add rate limit headers
 			res.set('X-RateLimit-Limit', maxRequests);
 			res.set('X-RateLimit-Remaining', 0);
 			res.set('X-RateLimit-Reset', retryAfter);
-
-			// Send 429 response with Retry-After header
 			return res.status(429).json({
 				message: 'Too many requests. Please try again later.',
 				'Retry-After': retryAfter,
 			});
 		} else {
-			// Increment request count and reset TTL
-			await client.setEx(
-				userIP,
-				timeWindow,
-				(requestCount + 1).toString()
-			);
+			// Increment and set expiry if it's a new key
+			await client
+				.multi()
+				.incr(redisKey)
+				.expire(redisKey, timeWindow)
+				.exec();
 
-			// Add rate limit headers
+			// Add headers to the response
 			res.set('X-RateLimit-Limit', maxRequests);
 			res.set('X-RateLimit-Remaining', maxRequests - (requestCount + 1));
 			res.set('X-RateLimit-Reset', timeWindow);
@@ -87,18 +85,33 @@ const rateLimiter = async (req, res, next) => {
 	}
 };
 
-// Global error handler
-app.use((err, req, res, next) => {
-	console.error('Global error handler:', err);
-	res.status(500).json({ message: 'Internal server error' });
+// Example route with dynamic rate limiting
+app.get('/', rateLimiter(60, 5), (req, res) => {
+	res.send('Welcome! Your request is within limit.');
 });
 
-// Sample route with rate limiter
-app.get('/', rateLimiter, (req, res) => {
-	res.send('Welcome, your request is within limit!');
+// Example route with a higher rate limit
+app.get('/premium', rateLimiter(60, 10), (req, res) => {
+	res.send('Welcome premium user! You have more request allowance.');
 });
 
-// Listen for requests
+// Whitelist middleware to bypass rate limiting for specific IPs
+const whitelistIPs = ['127.0.0.1', '::1'];
+
+const whitelistRateLimiter =
+	(timeWindow, maxRequests) => async (req, res, next) => {
+		if (whitelistIPs.includes(req.ip)) {
+			return next(); // Bypass rate limit for whitelisted IPs
+		}
+		return rateLimiter(timeWindow, maxRequests)(req, res, next);
+	};
+
+// Route using the whitelisted rate limiter
+app.get('/whitelisted', whitelistRateLimiter(60, 5), (req, res) => {
+	res.send('Whitelisted IPs can bypass rate limits.');
+});
+
+// Start server
 app.listen(port, () => {
 	console.log(`Server running on http://localhost:${port}`);
 });
